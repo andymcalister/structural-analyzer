@@ -61,6 +61,68 @@ def encode_image(img: Image.Image) -> tuple[str, str]:
     return b64, "image/png"
 
 
+def crop_to_drawing(img: Image.Image) -> tuple[Image.Image, tuple[int,int,int,int]]:
+    """
+    Detect and crop to the main drawing rectangle on the page.
+    Returns (cropped_image, (x1, y1, x2, y2)) where coords are in original image space.
+    Falls back to a margin-based crop if contour detection fails.
+    """
+    import numpy as np
+    try:
+        import cv2
+        # Convert to numpy array for OpenCV
+        img_np = np.array(img.convert("RGB"))
+        gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+        
+        # Threshold to find dark lines (drawing borders)
+        _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+        
+        # Find contours
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if contours:
+            h, w = gray.shape
+            min_area = (w * h) * 0.1  # Must be at least 10% of page area
+            
+            best = None
+            best_area = 0
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area < min_area:
+                    continue
+                x, y, cw, ch = cv2.boundingRect(cnt)
+                # Must be reasonably rectangular (not too thin)
+                aspect = cw / ch if ch > 0 else 0
+                if 0.3 < aspect < 3.0 and area > best_area:
+                    best = (x, y, x + cw, y + ch)
+                    best_area = area
+            
+            if best:
+                x1, y1, x2, y2 = best
+                # Add small padding
+                pad = 10
+                x1 = max(0, x1 - pad)
+                y1 = max(0, y1 - pad)
+                x2 = min(w, x2 + pad)
+                y2 = min(h, y2 + pad)
+                cropped = img.crop((x1, y1, x2, y2))
+                return cropped, (x1, y1, x2, y2)
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    
+    # Fallback: crop away 8% margins (removes title blocks and borders)
+    w, h = img.size
+    mx = int(w * 0.06)
+    my = int(h * 0.06)
+    # For architectural drawings, crop more from bottom (legend/notes area)
+    my_bottom = int(h * 0.25)
+    x1, y1, x2, y2 = mx, my, w - mx, h - my_bottom
+    cropped = img.crop((x1, y1, x2, y2))
+    return cropped, (x1, y1, x2, y2)
+
+
 def identify_floor_plan_pages(images: list[Image.Image], api_key: str) -> list[int]:
     """Ask Claude which pages contain floor plans."""
     client = anthropic.Anthropic(api_key=api_key)
@@ -102,11 +164,7 @@ Return ONLY valid JSON like this:
     )
 
     raw = "".join(b.text for b in response.content if hasattr(b, "text"))
-    clean = raw.replace("```json", "").replace("```", "").strip()
-    match = re.search(r'\{[\s\S]*\}', clean)
-    if match:
-        clean = match.group(0)
-    result = json.loads(clean)
+    result = parse_json_response(raw)
     return result.get("floorPlanPages", [0]), result.get("pageDescriptions", {})
 
 
@@ -194,27 +252,12 @@ Building parameters:
 - Code: ASCE 7 / IBC"""
 
 
-def run_analysis(floor_img: Image.Image, params: dict, api_key: str) -> dict:
-    """Analyze a single floor plan image."""
-    b64, media_type = encode_image(floor_img)
-    client = anthropic.Anthropic(api_key=api_key)
-
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=8096,
-        system=build_system_prompt(params),
-        messages=[{"role": "user", "content": [
-            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
-            {"type": "text", "text": "Analyze this floor plan and return the structural analysis JSON including accurate bbox coordinates for every wall. Return ONLY the JSON object with no additional text."}
-        ]}]
-    )
-
-    raw = "".join(b.text for b in response.content if hasattr(b, "text"))
+def parse_json_response(raw: str) -> dict:
+    """Robustly parse JSON from Claude response."""
     clean = raw.replace("```json", "").replace("```", "").strip()
     match = re.search(r'\{[\s\S]*\}', clean)
     if match:
         clean = match.group(0)
-
     try:
         return json.loads(clean)
     except json.JSONDecodeError:
@@ -232,7 +275,39 @@ def run_analysis(floor_img: Image.Image, params: dict, api_key: str) -> dict:
             raise ValueError(f"Could not parse response as JSON: {e}")
 
 
-def draw_wall_overlays(base_img: Image.Image, walls: list, openings: list) -> Image.Image:
+def run_analysis(floor_img: Image.Image, params: dict, api_key: str) -> tuple[dict, Image.Image, tuple]:
+    """
+    Analyze a single floor plan image.
+    Crops to the drawing area first so bbox coords align with the actual plan.
+    Returns (result, cropped_img, crop_box) where crop_box is (x1,y1,x2,y2) in original coords.
+    """
+    cropped_img, crop_box = crop_to_drawing(floor_img)
+    b64, media_type = encode_image(cropped_img)
+    client = anthropic.Anthropic(api_key=api_key)
+
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=8096,
+        system=build_system_prompt(params),
+        messages=[{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
+            {"type": "text", "text": "Analyze this floor plan and return the structural analysis JSON including accurate bbox coordinates for every wall. The image you are seeing is already cropped to just the drawing area. Return ONLY the JSON object with no additional text."}
+        ]}]
+    )
+
+    raw = "".join(b.text for b in response.content if hasattr(b, "text"))
+    result = parse_json_response(raw)
+    return result, cropped_img, crop_box
+
+
+def draw_wall_overlays(base_img: Image.Image, walls: list, openings: list,
+                        full_img: Image.Image = None, crop_box: tuple = None) -> Image.Image:
+    """
+    Draw overlays on cropped drawing image, then paste back onto full page if provided.
+    base_img: the cropped drawing area
+    full_img: the original full page image (optional)
+    crop_box: (x1, y1, x2, y2) of crop in full_img coords (optional)
+    """
     img = base_img.convert("RGBA")
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
@@ -299,7 +374,15 @@ def draw_wall_overlays(base_img: Image.Image, walls: list, openings: list) -> Im
             oy1, oy2 = cy - 3, cy + 3
         draw.rectangle([ox1, oy1, ox2, oy2], fill=(255, 165, 0, 100), outline=(200, 130, 0, 200), width=2)
 
-    return Image.alpha_composite(img, overlay).convert("RGB")
+    annotated_crop = Image.alpha_composite(img, overlay).convert("RGB")
+    
+    # If we have the full page, paste annotated crop back in
+    if full_img is not None and crop_box is not None:
+        result_full = full_img.convert("RGB").copy()
+        result_full.paste(annotated_crop, (crop_box[0], crop_box[1]))
+        return result_full
+    
+    return annotated_crop
 
 
 def add_legend(img: Image.Image) -> Image.Image:
@@ -329,7 +412,8 @@ def add_legend(img: Image.Image) -> Image.Image:
     return new_img
 
 
-def render_floor_analysis(label: str, floor_img: Image.Image, result: dict, params: dict):
+def render_floor_analysis(label: str, cropped_img: Image.Image, result: dict, params: dict,
+                           full_img: Image.Image = None, crop_box: tuple = None):
     """Render results for a single floor plan."""
     summary = result.get("summary", {})
     walls = result.get("walls", [])
@@ -351,7 +435,7 @@ def render_floor_analysis(label: str, floor_img: Image.Image, result: dict, para
     ])
 
     with tab0:
-        annotated = draw_wall_overlays(floor_img, walls, openings)
+        annotated = draw_wall_overlays(cropped_img, walls, openings, full_img, crop_box)
         annotated = add_legend(annotated)
         st.image(annotated, caption=f"Annotated — {label}", use_column_width=True)
         buf = io.BytesIO()
@@ -546,8 +630,8 @@ if uploaded_file:
                 label = page_descriptions.get(str(pg), f"Floor plan — page {pg}")
                 with st.spinner(f"Analyzing: {label}…"):
                     try:
-                        result = run_analysis(all_images[pg], params, api_key_input)
-                        all_results.append((label, all_images[pg], result))
+                        result, cropped_img, crop_box = run_analysis(all_images[pg], params, api_key_input)
+                        all_results.append((label, all_images[pg], cropped_img, crop_box, result))
                     except Exception as e:
                         st.error(f"Analysis failed for page {pg}: {e}")
 
@@ -561,15 +645,15 @@ if "all_results" in st.session_state and st.session_state["all_results"]:
     params = st.session_state["last_params"]
 
     if len(results) == 1:
-        label, floor_img, result = results[0]
+        label, full_img, cropped_img, crop_box, result = results[0]
         st.subheader(f"📐 {label}")
-        render_floor_analysis(label, floor_img, result, params)
+        render_floor_analysis(label, cropped_img, result, params, full_img, crop_box)
     else:
         # Multiple floor plans — show as tabs
-        floor_tabs = st.tabs([f"📐 {label}" for label, _, _ in results])
-        for tab, (label, floor_img, result) in zip(floor_tabs, results):
+        floor_tabs = st.tabs([f"📐 {label}" for label, _, _, _, _ in results])
+        for tab, (label, full_img, cropped_img, crop_box, result) in zip(floor_tabs, results):
             with tab:
-                render_floor_analysis(label, floor_img, result, params)
+                render_floor_analysis(label, cropped_img, result, params, full_img, crop_box)
 else:
     if not uploaded_file:
         st.markdown("---")
