@@ -176,7 +176,7 @@ Return ONLY valid JSON:
 Be precise with bbox — place them where walls actually appear in this image.
 flagSeverity: critical/warning/info. priority: high/medium/low.
 
-Parameters: Type={params['building_type']}, Stories={params['stories']},
+Parameters: Type={params['building_type']}, Stories={params.get('stories', 'auto-detected')},
 Material={params['wall_material']}, Floor={params['floor_system']},
 Roof={params['roof_type']}, Seismic={params['seismic']},
 Wind={params['wind']}, Snow={params['snow']}psf, Code=ASCE 7/IBC"""
@@ -328,7 +328,6 @@ with st.sidebar:
 
     st.subheader("Project parameters")
     building_type = st.selectbox("Building type", ["Single-family residential", "Multi-family residential", "Light commercial", "Mixed use"])
-    stories = st.selectbox("Number of stories", ["1", "2", "3", "4+"])
     wall_material = st.selectbox("Wall material", [
         "Wood frame (2×6 @ 16\" OC)", "Wood frame (2×4 @ 16\" OC)",
         "CMU (8\" block)", "CMU (12\" block)",
@@ -353,71 +352,130 @@ st.caption("Upload a PDF drawing set — floor plan pages are detected automatic
 uploaded_file = st.file_uploader("Upload drawing set (PDF)", type=["pdf", "png", "jpg", "jpeg"])
 
 if uploaded_file:
-    file_bytes = uploaded_file.read()
+    # Reset detection state when a new file is uploaded
+    if st.session_state.get("last_filename") != uploaded_file.name:
+        for key in ["all_images", "page_descriptions", "detected_floor_pages",
+                    "floor_analyses", "stacking_by_floor", "last_params"]:
+            st.session_state.pop(key, None)
+        st.session_state["last_filename"] = uploaded_file.name
 
-    with st.spinner("Loading drawing…"):
-        try:
-            if uploaded_file.name.lower().endswith(".pdf"):
-                all_images = pdf_to_images(file_bytes)
-                st.info(f"📄 **{uploaded_file.name}** — {len(all_images)} page(s)")
+    # Load the file
+    if "all_images" not in st.session_state:
+        file_bytes = uploaded_file.read()
+        with st.spinner("Loading drawing…"):
+            try:
+                if uploaded_file.name.lower().endswith(".pdf"):
+                    all_images = pdf_to_images(file_bytes)
+                    st.session_state["all_images"] = all_images
+                    st.session_state["file_bytes"] = file_bytes
+                else:
+                    img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+                    st.session_state["all_images"] = [img]
+                    st.session_state["file_bytes"] = file_bytes
+            except Exception as e:
+                st.error(f"Could not load file: {e}")
+                st.stop()
+
+    all_images = st.session_state["all_images"]
+    st.info(f"📄 **{uploaded_file.name}** — {len(all_images)} page(s) loaded")
+
+    # ── STEP 1: Detect floor plan pages ──────────────────────────────────────
+    if "detected_floor_pages" not in st.session_state:
+        if st.button("🔍 Scan pages for floor plans", use_container_width=True):
+            if not api_key_input:
+                st.error("API key not configured.")
             else:
-                img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-                all_images = [img]
-                st.info(f"🖼️ **{uploaded_file.name}** loaded")
-        except Exception as e:
-            st.error(f"Could not load file: {e}")
-            st.stop()
+                if len(all_images) > 1:
+                    with st.spinner(f"Scanning {len(all_images)} pages…"):
+                        try:
+                            floor_pages, page_descriptions = identify_floor_plan_pages(all_images, api_key_input)
+                        except Exception as e:
+                            st.warning(f"Page scan failed ({e}) — defaulting to page 0.")
+                            floor_pages = [0]
+                            page_descriptions = {"0": "Floor plan — page 0"}
+                else:
+                    floor_pages = [0]
+                    page_descriptions = {"0": "Floor plan — page 0"}
 
-    if st.button("▶ Run structural analysis", type="primary", use_container_width=True):
-        if not api_key_input:
-            st.error("API key not configured.")
+                st.session_state["detected_floor_pages"] = floor_pages
+                st.session_state["page_descriptions"] = page_descriptions
+                st.rerun()
+    else:
+        # ── STEP 2: Show detected floors, let engineer confirm ────────────────
+        floor_pages = st.session_state["detected_floor_pages"]
+        page_descriptions = st.session_state.get("page_descriptions", {})
+        all_images = st.session_state["all_images"]
+
+        st.markdown("---")
+        st.subheader("📋 Detected floor plans")
+        st.caption("Review and adjust which pages to include before running analysis.")
+
+        # Show thumbnails with checkboxes
+        n_pages = len(all_images)
+        confirmed_pages = []
+
+        # Show all pages as a grid — floor plans checked by default, others unchecked
+        cols_per_row = min(4, n_pages)
+        rows = [list(range(n_pages))[i:i+cols_per_row] for i in range(0, n_pages, cols_per_row)]
+
+        for row in rows:
+            cols = st.columns(len(row))
+            for col, pg_idx in zip(cols, row):
+                with col:
+                    desc = page_descriptions.get(str(pg_idx), f"Page {pg_idx}")
+                    is_floor = pg_idx in floor_pages
+                    thumb = all_images[pg_idx].copy()
+                    thumb.thumbnail((300, 300))
+                    st.image(thumb, use_column_width=True)
+                    icon = "🏠" if is_floor else "📐"
+                    checked = st.checkbox(
+                        f"{icon} {desc}",
+                        value=is_floor,
+                        key=f"page_check_{pg_idx}"
+                    )
+                    if checked:
+                        confirmed_pages.append(pg_idx)
+
+        confirmed_pages.sort()
+
+        if not confirmed_pages:
+            st.warning("Select at least one floor plan page to analyze.")
         else:
-            params = {
-                "building_type": building_type, "stories": stories,
-                "wall_material": wall_material, "floor_system": floor_system,
-                "roof_type": roof_type, "seismic": seismic,
-                "wind": wind, "snow": snow
-            }
+            n_floors = len(confirmed_pages)
+            floor_label = "floor" if n_floors == 1 else "floors"
+            st.success(f"✅ **{n_floors} {floor_label} selected** — pages: {', '.join(str(p) for p in confirmed_pages)}")
 
-            # Step 1: identify floor plan pages
-            if len(all_images) > 1:
-                with st.spinner(f"Scanning {len(all_images)} pages for floor plans…"):
-                    try:
-                        floor_pages, page_descriptions = identify_floor_plan_pages(all_images, api_key_input)
-                    except Exception as e:
-                        st.warning(f"Page detection failed ({e}), using page 0.")
-                        floor_pages = [0]
-                        page_descriptions = {"0": "Floor plan"}
-                if not floor_pages:
-                    st.error("No floor plan pages found.")
-                    st.stop()
-                st.success(f"✅ Floor plan page(s): {', '.join(str(p) for p in floor_pages)}")
-                with st.expander("📋 All pages"):
-                    for pg_idx, desc in page_descriptions.items():
-                        icon = "🏠" if int(pg_idx) in floor_pages else "📐"
-                        st.write(f"{icon} **Page {pg_idx}:** {desc}")
-            else:
-                floor_pages = [0]
-                page_descriptions = {"0": "Floor plan"}
+            if st.button(f"▶ Analyze {n_floors} {floor_label}", type="primary", use_container_width=True):
+                if not api_key_input:
+                    st.error("API key not configured.")
+                else:
+                    params = {
+                        "building_type": building_type,
+                        "stories": str(n_floors),
+                        "wall_material": wall_material, "floor_system": floor_system,
+                        "roof_type": roof_type, "seismic": seismic,
+                        "wind": wind, "snow": snow
+                    }
 
-            # Step 2: analyze each floor plan
-            floor_analyses = []  # (label, full_img, cropped_img, crop_box, result)
-            for pg in floor_pages:
-                label = page_descriptions.get(str(pg), f"Floor plan — page {pg}")
-                with st.spinner(f"Analyzing: {label}…"):
-                    try:
-                        result, cropped_img, crop_box = run_analysis(all_images[pg], params, api_key_input)
-                        floor_analyses.append((label, all_images[pg], cropped_img, crop_box, result))
-                    except Exception as e:
-                        st.error(f"Analysis failed for {label}: {e}")
+                    floor_analyses = []
+                    for pg in confirmed_pages:
+                        label = page_descriptions.get(str(pg), f"Floor plan — page {pg}")
+                        with st.spinner(f"Analyzing: {label}…"):
+                            try:
+                                result, cropped_img, crop_box = run_analysis(
+                                    all_images[pg], params, api_key_input
+                                )
+                                floor_analyses.append((label, all_images[pg], cropped_img, crop_box, result))
+                            except Exception as e:
+                                st.error(f"Analysis failed for {label}: {e}")
 
-            # Step 3: cross-reference stacking walls across floors
-            floor_results_for_stacking = [(label, result) for label, _, _, _, result in floor_analyses]
-            stacking_by_floor = find_stacking_pairs(floor_results_for_stacking)
+                    floor_results_for_stacking = [(label, result) for label, _, _, _, result in floor_analyses]
+                    stacking_by_floor = find_stacking_pairs(floor_results_for_stacking)
 
-            st.session_state["floor_analyses"] = floor_analyses
-            st.session_state["stacking_by_floor"] = stacking_by_floor
-            st.session_state["last_params"] = params
+                    st.session_state["floor_analyses"] = floor_analyses
+                    st.session_state["stacking_by_floor"] = stacking_by_floor
+                    st.session_state["last_params"] = params
+                    st.rerun()
 
 if "floor_analyses" in st.session_state and st.session_state["floor_analyses"]:
     st.markdown("---")
@@ -440,17 +498,17 @@ else:
         st.markdown("---")
         st.markdown("""
 **How it works:**
-1. Upload a PDF drawing set
-2. Set project parameters in the sidebar
-3. Click **Run structural analysis**
-4. App scans all pages, finds floor plans automatically, analyzes each one
-5. Walls are highlighted using OpenCV line detection for accuracy
+1. Upload a PDF drawing set using the uploader above
+2. Click **Scan pages** — the app identifies all floor plan pages and shows thumbnails
+3. Review detected floors, check/uncheck pages, then click **Analyze**
+4. Each floor is analyzed separately with annotated wall overlays
+5. Stacking walls across floors are cross-referenced and highlighted purple
 
 **Color legend:**
 - 🔴 Red — load bearing
-- 🟣 Purple — stacking walls across floors (↕ label shows partner wall)
-- ⬜ Gray — non-structural
+- 🟣 Purple ↕ — stacking walls (load path continuous across floors)
+- ⬜ Gray — non-structural partitions
 - 🟠 Orange — openings requiring headers
 
-*Reviewed by Claude (claude-sonnet-4-6). Engineer stamp required.*
+*Analysis by Claude (claude-sonnet-4-6). Engineer review and stamp required.*
         """)
