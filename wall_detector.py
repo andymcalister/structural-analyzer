@@ -201,13 +201,13 @@ def classify_walls(walls: list, img: Image.Image, plan_box: tuple,
     b64 = base64.standard_b64encode(buf.getvalue()).decode("utf-8")
 
     wall_summary = [{
-        "id": w["id"],
-        "orient": w["orient"],
-        "length_pct": w["length_pct"],
-        "x_pct": w["x_pct"],
-        "y_pct": w["y_pct"],
-        "at_edge": w["at_edge"],
-        "span": w["span_pct"],
+        "id": str(w["id"]),
+        "orient": str(w["orient"]),
+        "length_pct": float(w["length_pct"]),
+        "x_pct": float(w["x_pct"]),
+        "y_pct": float(w["y_pct"]),
+        "at_edge": bool(w["at_edge"]),
+        "span": str(w["span_pct"]),
     } for w in walls]
 
     prompt = f"""You are a licensed structural engineer reviewing a floor plan.
