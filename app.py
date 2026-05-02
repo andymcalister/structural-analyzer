@@ -201,11 +201,11 @@ def run_analysis(floor_img: Image.Image, params: dict, api_key: str) -> dict:
 
     response = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=4096,
+        max_tokens=8096,
         system=build_system_prompt(params),
         messages=[{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
-            {"type": "text", "text": "Analyze this floor plan and return the structural analysis JSON including accurate bbox coordinates for every wall."}
+            {"type": "text", "text": "Analyze this floor plan and return the structural analysis JSON including accurate bbox coordinates for every wall. Return ONLY the JSON object with no additional text."}
         ]}]
     )
 
@@ -214,7 +214,22 @@ def run_analysis(floor_img: Image.Image, params: dict, api_key: str) -> dict:
     match = re.search(r'\{[\s\S]*\}', clean)
     if match:
         clean = match.group(0)
-    return json.loads(clean)
+
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        clean = re.sub(r',\s*([}\]])', r'\1', clean)
+        clean = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', clean)
+        try:
+            return json.loads(clean)
+        except json.JSONDecodeError as e:
+            last_brace = clean.rfind('}')
+            if last_brace > 0:
+                try:
+                    return json.loads(clean[:last_brace + 1])
+                except json.JSONDecodeError:
+                    pass
+            raise ValueError(f"Could not parse response as JSON: {e}")
 
 
 def draw_wall_overlays(base_img: Image.Image, walls: list, openings: list) -> Image.Image:
