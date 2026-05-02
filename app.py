@@ -3,6 +3,8 @@ import anthropic
 import base64
 import json
 import re
+import io
+from PIL import Image, ImageDraw, ImageFont
 
 st.set_page_config(
     page_title="Structural Wall Analyzer",
@@ -36,36 +38,98 @@ def get_api_key():
         return os.environ.get("ANTHROPIC_API_KEY", "")
 
 
-def encode_file(uploaded_file) -> tuple[str, str]:
-    file_bytes = uploaded_file.read()
-    b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
-    name = uploaded_file.name.lower()
-    if name.endswith(".pdf"):
-        media_type = "application/pdf"
-    elif name.endswith(".png"):
-        media_type = "image/png"
-    elif name.endswith((".jpg", ".jpeg")):
-        media_type = "image/jpeg"
-    else:
-        media_type = "image/png"
-    return b64, media_type
+def pdf_to_images(pdf_bytes: bytes, dpi: int = 150) -> list[Image.Image]:
+    """Convert all PDF pages to PIL Images."""
+    import fitz
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    images = []
+    for i in range(len(doc)):
+        pg = doc[i]
+        mat = fitz.Matrix(dpi / 72, dpi / 72)
+        pix = pg.get_pixmap(matrix=mat, alpha=False)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        images.append(img)
+    doc.close()
+    return images
+
+
+def encode_image(img: Image.Image) -> tuple[str, str]:
+    """Encode PIL image to base64 PNG."""
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    b64 = base64.standard_b64encode(buf.getvalue()).decode("utf-8")
+    return b64, "image/png"
+
+
+def identify_floor_plan_pages(images: list[Image.Image], api_key: str) -> list[int]:
+    """Ask Claude which pages contain floor plans."""
+    client = anthropic.Anthropic(api_key=api_key)
+
+    content = []
+    for i, img in enumerate(images):
+        b64, media_type = encode_image(img)
+        content.append({
+            "type": "text",
+            "text": f"Page {i} (0-indexed):"
+        })
+        content.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type, "data": b64}
+        })
+
+    content.append({
+        "type": "text",
+        "text": """Review all the pages above. Identify which page numbers contain floor plans (plan views showing room layouts, wall positions, dimensions from above).
+
+Do NOT include: elevations, sections, details, foundation plans, roof framing plans, title sheets, or schedules.
+
+Return ONLY valid JSON like this:
+{
+  "floorPlanPages": [0, 2],
+  "pageDescriptions": {
+    "0": "Floor plan — main level",
+    "1": "South and East elevations",
+    "2": "Floor plan — upper level",
+    "3": "Foundation plan"
+  }
+}"""
+    })
+
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=500,
+        messages=[{"role": "user", "content": content}]
+    )
+
+    raw = "".join(b.text for b in response.content if hasattr(b, "text"))
+    clean = raw.replace("```json", "").replace("```", "").strip()
+    match = re.search(r'\{[\s\S]*\}', clean)
+    if match:
+        clean = match.group(0)
+    result = json.loads(clean)
+    return result.get("floorPlanPages", [0]), result.get("pageDescriptions", {})
 
 
 def build_system_prompt(params: dict) -> str:
-    return f"""You are a structural engineering analysis assistant. A licensed structural engineer will review all your outputs. You are performing PRELIMINARY analysis only to accelerate the engineer's workflow. Never claim your outputs are final or construction-ready.
+    return f"""You are a structural engineering analysis assistant. A licensed structural engineer will review all your outputs. You are performing PRELIMINARY analysis only.
 
 Analyze the uploaded architectural floor plan and perform preliminary structural wall identification and load calculations.
 
-Return ONLY valid JSON (no markdown fences, no preamble) with this exact structure:
+IMPORTANT: For each wall, estimate its bounding box as normalized coordinates (0.0 to 1.0) relative to the image dimensions:
+- x1, y1 = top-left corner (0,0 is top-left of image)
+- x2, y2 = bottom-right corner (1,1 is bottom-right of image)
+
+Return ONLY valid JSON with this exact structure:
 {{
   "drawingDescription": "detailed description of what you see",
-  "sheetsIdentified": ["Floor Plan", "Elevations", "Foundation Plan"],
+  "sheetsIdentified": ["Floor Plan — Main Level"],
   "walls": [
     {{
       "id": "W1",
       "description": "North exterior wall, full building width",
       "location": "North exterior",
       "loadBearing": true,
+      "stacksWithWall": null,
       "estimatedLength": 48,
       "estimatedHeight": 9,
       "tributaryWidth": 6,
@@ -74,7 +138,8 @@ Return ONLY valid JSON (no markdown fences, no preamble) with this exact structu
       "totalLoadPsf": 35,
       "totalLoadPlf": 210,
       "flag": "Verify rafter tie connection",
-      "flagSeverity": "info"
+      "flagSeverity": "info",
+      "bbox": {{"x1": 0.1, "y1": 0.05, "x2": 0.9, "y2": 0.08}}
     }}
   ],
   "openings": [
@@ -83,7 +148,8 @@ Return ONLY valid JSON (no markdown fences, no preamble) with this exact structu
       "type": "Sliding door",
       "size": "6-0 x 6-8",
       "headerRequired": "4x12 minimum",
-      "notes": "Verify jack stud count and bearing length"
+      "notes": "Verify jack stud count and bearing length",
+      "bbox": {{"x1": 0.5, "y1": 0.1, "x2": 0.6, "y2": 0.15}}
     }}
   ],
   "summary": {{
@@ -98,22 +164,23 @@ Return ONLY valid JSON (no markdown fences, no preamble) with this exact structu
     "governingCombo": "1.2D + 1.6L",
     "criticalWall": "W5",
     "criticalWallLoad": 900,
-    "houseArea": 1136,
-    "garageArea": 280
+    "houseArea": 0,
+    "garageArea": 0
   }},
   "recommendations": [
     {{
       "id": "R1",
       "priority": "high",
-      "title": "Interior bearing wall foundation alignment",
-      "detail": "Detailed explanation of the recommendation."
+      "title": "Recommendation title",
+      "detail": "Detailed explanation."
     }}
   ],
   "engineerNarrative": "2-3 paragraph overall narrative for the reviewing engineer."
 }}
 
-flagSeverity options: critical, warning, info
-recommendation priority options: high, medium, low
+For stacksWithWall: if a wall aligns with a wall on another floor, set this to that wall's ID. Otherwise null.
+flagSeverity: critical, warning, or info
+priority: high, medium, or low
 
 Building parameters:
 - Type: {params['building_type']}
@@ -127,25 +194,20 @@ Building parameters:
 - Code: ASCE 7 / IBC"""
 
 
-def run_analysis(uploaded_file, params: dict, api_key: str):
-    b64, media_type = encode_file(uploaded_file)
+def run_analysis(floor_img: Image.Image, params: dict, api_key: str) -> dict:
+    """Analyze a single floor plan image."""
+    b64, media_type = encode_image(floor_img)
     client = anthropic.Anthropic(api_key=api_key)
 
-    if media_type == "application/pdf":
-        content_block = {"type": "document", "source": {"type": "base64", "media_type": media_type, "data": b64}}
-    else:
-        content_block = {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}}
-
-    with st.spinner("Analyzing drawing — this may take 20–40 seconds…"):
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=4096,
-            system=build_system_prompt(params),
-            messages=[{"role": "user", "content": [
-                content_block,
-                {"type": "text", "text": "Analyze this architectural drawing set and return the structural analysis JSON."}
-            ]}]
-        )
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=4096,
+        system=build_system_prompt(params),
+        messages=[{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
+            {"type": "text", "text": "Analyze this floor plan and return the structural analysis JSON including accurate bbox coordinates for every wall."}
+        ]}]
+    )
 
     raw = "".join(b.text for b in response.content if hasattr(b, "text"))
     clean = raw.replace("```json", "").replace("```", "").strip()
@@ -155,24 +217,137 @@ def run_analysis(uploaded_file, params: dict, api_key: str):
     return json.loads(clean)
 
 
-def render_results(result: dict, params: dict):
+def draw_wall_overlays(base_img: Image.Image, walls: list, openings: list) -> Image.Image:
+    img = base_img.convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    w, h = img.size
+
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", max(12, w // 80))
+    except Exception:
+        font = ImageFont.load_default()
+
+    stacking_ids = set()
+    for wall in walls:
+        if wall.get("stacksWithWall"):
+            stacking_ids.add(wall["id"])
+            stacking_ids.add(wall["stacksWithWall"])
+
+    for wall in walls:
+        bbox = wall.get("bbox")
+        if not bbox:
+            continue
+        x1 = int(bbox["x1"] * w)
+        y1 = int(bbox["y1"] * h)
+        x2 = int(bbox["x2"] * w)
+        y2 = int(bbox["y2"] * h)
+
+        if abs(x2 - x1) < 6:
+            cx = (x1 + x2) // 2
+            x1, x2 = cx - 3, cx + 3
+        if abs(y2 - y1) < 6:
+            cy = (y1 + y2) // 2
+            y1, y2 = cy - 3, cy + 3
+
+        wall_id = wall.get("id", "")
+        is_load_bearing = wall.get("loadBearing", False)
+        is_stacking = wall_id in stacking_ids
+
+        if is_stacking and is_load_bearing:
+            fill = (138, 43, 226, 120)
+            border = (138, 43, 226, 220)
+        elif is_load_bearing:
+            fill = (220, 50, 50, 110)
+            border = (200, 30, 30, 220)
+        else:
+            fill = (100, 100, 100, 70)
+            border = (80, 80, 80, 160)
+
+        draw.rectangle([x1, y1, x2, y2], fill=fill, outline=border, width=2)
+        label = wall_id + (" ⬆" if is_stacking else "")
+        draw.text((x1 + 4, y1 + 2), label, fill=(255, 255, 255, 240), font=font)
+
+    for opening in openings:
+        bbox = opening.get("bbox")
+        if not bbox:
+            continue
+        ox1 = int(bbox["x1"] * w)
+        oy1 = int(bbox["y1"] * h)
+        ox2 = int(bbox["x2"] * w)
+        oy2 = int(bbox["y2"] * h)
+        if abs(ox2 - ox1) < 4:
+            cx = (ox1 + ox2) // 2
+            ox1, ox2 = cx - 3, cx + 3
+        if abs(oy2 - oy1) < 4:
+            cy = (oy1 + oy2) // 2
+            oy1, oy2 = cy - 3, cy + 3
+        draw.rectangle([ox1, oy1, ox2, oy2], fill=(255, 165, 0, 100), outline=(200, 130, 0, 200), width=2)
+
+    return Image.alpha_composite(img, overlay).convert("RGB")
+
+
+def add_legend(img: Image.Image) -> Image.Image:
+    legend_h = 60
+    new_img = Image.new("RGB", (img.width, img.height + legend_h), (245, 245, 245))
+    new_img.paste(img, (0, 0))
+    draw = ImageDraw.Draw(new_img)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 13)
+    except Exception:
+        font = ImageFont.load_default()
+
+    items = [
+        ((220, 50, 50), "Load bearing"),
+        ((138, 43, 226), "Stacking (multi-floor)"),
+        ((100, 100, 100), "Non-structural"),
+        ((255, 165, 0), "Opening / header"),
+    ]
+    x = 20
+    y_box = img.height + 15
+    y_text = img.height + 18
+    for color, label in items:
+        draw.rectangle([x, y_box, x + 20, y_box + 20], fill=color, outline=(50, 50, 50))
+        draw.text((x + 26, y_text), label, fill=(40, 40, 40), font=font)
+        x += 185
+    draw.text((20, img.height + 42), "⚠ Wall positions are approximate — for preliminary review only", fill=(120, 80, 0), font=font)
+    return new_img
+
+
+def render_floor_analysis(label: str, floor_img: Image.Image, result: dict, params: dict):
+    """Render results for a single floor plan."""
     summary = result.get("summary", {})
     walls = result.get("walls", [])
     openings = result.get("openings", [])
     recs = result.get("recommendations", [])
+    stacking_count = sum(1 for w in walls if w.get("stacksWithWall"))
 
-    st.success("Analysis complete — review all findings with your structural engineer.")
-
+    # Metrics
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Walls identified", summary.get("totalWalls", len(walls)))
     col2.metric("Load bearing", summary.get("loadBearingCount", sum(1 for w in walls if w.get("loadBearing"))))
-    col3.metric("Critical wall", summary.get("criticalWall", "—"))
+    col3.metric("Stacking walls", stacking_count)
     col4.metric("Peak load", f"{summary.get('criticalWallLoad', '—')} plf")
-    col5.metric("Governing load", summary.get("governingLoad", "Gravity"))
+    col5.metric("Critical wall", summary.get("criticalWall", "—"))
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        ["📋 Drawing overview", "🧱 Wall analysis", "🚪 Openings", "⚠️ Recommendations", "📝 Engineer narrative"]
-    )
+    tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "🗺️ Annotated drawing", "📋 Overview", "🧱 Wall analysis",
+        "🚪 Openings", "⚠️ Recommendations", "📝 Engineer narrative"
+    ])
+
+    with tab0:
+        annotated = draw_wall_overlays(floor_img, walls, openings)
+        annotated = add_legend(annotated)
+        st.image(annotated, caption=f"Annotated — {label}", use_column_width=True)
+        buf = io.BytesIO()
+        annotated.save(buf, format="PNG")
+        st.download_button(
+            f"⬇ Download annotated drawing — {label}",
+            data=buf.getvalue(),
+            file_name=f"structural_annotated_{label.replace(' ', '_')}.png",
+            mime="image/png",
+            key=f"dl_{label}"
+        )
 
     with tab1:
         st.subheader("Drawing interpretation")
@@ -204,9 +379,9 @@ def render_results(result: dict, params: dict):
                 rows.append({
                     "ID": w.get("id", ""),
                     "Location / description": w.get("description", ""),
-                    "Load bearing": "✅ Load bearing" if w.get("loadBearing") else "— Non-structural",
+                    "Load bearing": "✅ Yes" if w.get("loadBearing") else "— No",
+                    "Stacks with": w.get("stacksWithWall") or "—",
                     "Length (ft)": w.get("estimatedLength", ""),
-                    "Height (ft)": w.get("estimatedHeight", ""),
                     "Trib. width (ft)": w.get("tributaryWidth", "—") if w.get("loadBearing") else "—",
                     "Total load (plf)": w.get("totalLoadPlf", "—") if w.get("loadBearing") else "—",
                     "Flag": f"{flag_icon} {w.get('flag', '')}" if w.get("flag") else "",
@@ -221,6 +396,8 @@ def render_results(result: dict, params: dict):
                 f"Total load: {critical.get('totalLoadPlf')} plf | "
                 f"Tributary width: {critical.get('tributaryWidth')} ft"
             )
+        if stacking_count:
+            st.info(f"**{stacking_count} stacking wall(s) identified** — shown in purple on the annotated drawing. Verify continuous load path from roof to foundation.")
 
     with tab3:
         st.subheader("Openings & headers")
@@ -240,8 +417,8 @@ def render_results(result: dict, params: dict):
         for rec in sorted(recs, key=lambda r: priority_order.get(r.get("priority", "low"), 2)):
             priority = rec.get("priority", "low")
             icon = {"high": "🔴", "medium": "🟡", "low": "🔵"}.get(priority, "🔵")
-            label = {"high": "High priority", "medium": "Medium priority", "low": "Low priority"}.get(priority, "")
-            with st.expander(f"{icon} {rec.get('id', '')} — {rec.get('title', '')} ({label})"):
+            label_str = {"high": "High priority", "medium": "Medium priority", "low": "Low priority"}.get(priority, "")
+            with st.expander(f"{icon} {rec.get('id', '')} — {rec.get('title', '')} ({label_str})"):
                 st.write(rec.get("detail", ""))
 
     with tab5:
@@ -259,9 +436,8 @@ with st.sidebar:
     st.caption("Preliminary analysis tool for structural engineers")
     st.markdown("""
     <div class="disclaimer">
-    <strong>Engineering review required.</strong> This tool generates preliminary analysis only. 
-    All outputs must be reviewed and stamped by a licensed structural engineer. 
-    The engineer of record bears full professional liability.
+    <strong>Engineering review required.</strong> Preliminary analysis only.
+    Must be reviewed and stamped by a licensed structural engineer.
     </div>
     """, unsafe_allow_html=True)
 
@@ -289,19 +465,30 @@ with st.sidebar:
 # ── Main area ─────────────────────────────────────────────────────────────────
 
 st.title("Structural Wall Analyzer")
-st.caption("Upload an architectural floor plan to identify load-bearing walls and generate preliminary structural calculations.")
+st.caption("Upload a PDF drawing set — the app automatically identifies floor plan pages and analyzes each one.")
 
 uploaded_file = st.file_uploader(
-    "Upload floor plan drawing",
+    "Upload drawing set (PDF)",
     type=["pdf", "png", "jpg", "jpeg"],
-    help="PDF, PNG, or JPG — architectural drawings, CAD exports, or scanned plans"
+    help="PDF preferred. Multi-sheet drawing sets supported — floor plan pages are detected automatically."
 )
 
 if uploaded_file:
-    if "image" in uploaded_file.type:
-        st.image(uploaded_file, caption=uploaded_file.name, use_column_width=True)
-    else:
-        st.info(f"📄 Loaded: **{uploaded_file.name}** ({uploaded_file.size / 1024:.0f} KB)")
+    file_bytes = uploaded_file.read()
+    file_name = uploaded_file.name.lower()
+
+    with st.spinner("Loading PDF…"):
+        try:
+            if file_name.endswith(".pdf"):
+                all_images = pdf_to_images(file_bytes)
+                st.info(f"📄 **{uploaded_file.name}** — {len(all_images)} page(s) loaded")
+            else:
+                img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+                all_images = [img]
+                st.info(f"🖼️ **{uploaded_file.name}** loaded")
+        except Exception as e:
+            st.error(f"Could not load file: {e}")
+            st.stop()
 
     if st.button("▶ Run structural analysis", type="primary", use_container_width=True):
         if not api_key_input:
@@ -313,28 +500,76 @@ if uploaded_file:
                 "roof_type": roof_type, "seismic": seismic,
                 "wind": wind, "snow": snow
             }
-            try:
-                uploaded_file.seek(0)
-                result = run_analysis(uploaded_file, params, api_key_input)
-                st.session_state["last_result"] = result
-                st.session_state["last_params"] = params
-            except json.JSONDecodeError as e:
-                st.error(f"Failed to parse analysis response. Try again. Detail: {e}")
-            except Exception as e:
-                st.error(f"Analysis failed: {e}")
 
-if "last_result" in st.session_state:
+            # Step 1 — identify floor plan pages
+            if len(all_images) > 1:
+                with st.spinner(f"Scanning {len(all_images)} pages to identify floor plans…"):
+                    try:
+                        floor_pages, page_descriptions = identify_floor_plan_pages(all_images, api_key_input)
+                    except Exception as e:
+                        st.warning(f"Page detection failed ({e}), defaulting to page 0.")
+                        floor_pages = [0]
+                        page_descriptions = {"0": "Floor plan (page 0)"}
+
+                if not floor_pages:
+                    st.error("No floor plan pages detected in this PDF. Please check the drawing set.")
+                    st.stop()
+
+                st.success(f"✅ Floor plan page(s) detected: {', '.join(str(p) for p in floor_pages)}")
+
+                with st.expander("📋 All pages identified"):
+                    for pg_idx, desc in page_descriptions.items():
+                        icon = "🏠" if int(pg_idx) in floor_pages else "📐"
+                        st.write(f"{icon} **Page {pg_idx}:** {desc}")
+            else:
+                floor_pages = [0]
+                page_descriptions = {"0": "Floor plan"}
+
+            # Step 2 — analyze each floor plan page
+            all_results = []
+            for pg in floor_pages:
+                label = page_descriptions.get(str(pg), f"Floor plan — page {pg}")
+                with st.spinner(f"Analyzing: {label}…"):
+                    try:
+                        result = run_analysis(all_images[pg], params, api_key_input)
+                        all_results.append((label, all_images[pg], result))
+                    except Exception as e:
+                        st.error(f"Analysis failed for page {pg}: {e}")
+
+            st.session_state["all_results"] = all_results
+            st.session_state["last_params"] = params
+
+if "all_results" in st.session_state and st.session_state["all_results"]:
     st.markdown("---")
-    render_results(st.session_state["last_result"], st.session_state["last_params"])
+    st.success("Analysis complete — review all findings with your structural engineer.")
+    results = st.session_state["all_results"]
+    params = st.session_state["last_params"]
+
+    if len(results) == 1:
+        label, floor_img, result = results[0]
+        st.subheader(f"📐 {label}")
+        render_floor_analysis(label, floor_img, result, params)
+    else:
+        # Multiple floor plans — show as tabs
+        floor_tabs = st.tabs([f"📐 {label}" for label, _, _ in results])
+        for tab, (label, floor_img, result) in zip(floor_tabs, results):
+            with tab:
+                render_floor_analysis(label, floor_img, result, params)
 else:
     if not uploaded_file:
         st.markdown("---")
         st.markdown("""
         **How it works:**
-        1. Upload a floor plan (PDF or image) using the uploader above
+        1. Upload a PDF drawing set using the uploader above
         2. Set your project parameters in the sidebar
         3. Click **Run structural analysis**
-        4. Review the wall-by-wall breakdown, load calculations, and engineering recommendations
+        4. The app automatically scans all pages, identifies floor plans, and analyzes each one
 
-        *All analysis is performed by Claude (claude-sonnet-4-6) and must be reviewed by a licensed structural engineer.*
+        **Color legend on annotated drawings:**
+        - 🔴 Red — load bearing walls
+        - 🟣 Purple — stacking walls (continuous load path across floors)
+        - ⬜ Gray — non-structural partitions
+        - 🟠 Orange — openings requiring headers
+
+        *All analysis performed by Claude (claude-sonnet-4-6) and must be reviewed by a licensed structural engineer.*
         """)
