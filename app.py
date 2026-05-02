@@ -3,7 +3,6 @@ import anthropic
 import base64
 import json
 import re
-from pathlib import Path
 
 st.set_page_config(
     page_title="Structural Wall Analyzer",
@@ -23,32 +22,6 @@ st.markdown("""
         color: #5d4037;
         margin-bottom: 1rem;
     }
-    .load-bearing {
-        background: #ffebee;
-        color: #c62828;
-        padding: 2px 10px;
-        border-radius: 12px;
-        font-size: 12px;
-        font-weight: 600;
-    }
-    .non-structural {
-        background: #f5f5f5;
-        color: #616161;
-        padding: 2px 10px;
-        border-radius: 12px;
-        font-size: 12px;
-    }
-    .flag-critical {
-        color: #c62828;
-        font-weight: 600;
-    }
-    .metric-card {
-        background: #f8f9fa;
-        border: 1px solid #e9ecef;
-        border-radius: 8px;
-        padding: 16px;
-        text-align: center;
-    }
     h1 { font-size: 1.6rem !important; }
     .stTabs [data-baseweb="tab-list"] { gap: 8px; }
 </style>
@@ -56,7 +29,6 @@ st.markdown("""
 
 
 def get_api_key():
-    """Get API key from Streamlit secrets or environment."""
     try:
         return st.secrets["ANTHROPIC_API_KEY"]
     except Exception:
@@ -65,7 +37,6 @@ def get_api_key():
 
 
 def encode_file(uploaded_file) -> tuple[str, str]:
-    """Encode uploaded file to base64 and determine media type."""
     file_bytes = uploaded_file.read()
     b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
     name = uploaded_file.name.lower()
@@ -87,12 +58,12 @@ Analyze the uploaded architectural floor plan and perform preliminary structural
 
 Return ONLY valid JSON (no markdown fences, no preamble) with this exact structure:
 {{
-  "drawingDescription": "detailed description of what you see — scale, layout, rooms, key structural features visible across all sheets",
+  "drawingDescription": "detailed description of what you see",
   "sheetsIdentified": ["Floor Plan", "Elevations", "Foundation Plan"],
   "walls": [
     {{
       "id": "W1",
-      "description": "e.g. North exterior wall, full building width",
+      "description": "North exterior wall, full building width",
       "location": "North exterior",
       "loadBearing": true,
       "estimatedLength": 48,
@@ -110,7 +81,7 @@ Return ONLY valid JSON (no markdown fences, no preamble) with this exact structu
     {{
       "wallId": "W4",
       "type": "Sliding door",
-      "size": "6'-0\" x 6'-8\"",
+      "size": "6-0 x 6-8",
       "headerRequired": "4x12 minimum",
       "notes": "Verify jack stud count and bearing length"
     }}
@@ -135,63 +106,49 @@ Return ONLY valid JSON (no markdown fences, no preamble) with this exact structu
       "id": "R1",
       "priority": "high",
       "title": "Interior bearing wall foundation alignment",
-      "detail": "Detailed explanation of the recommendation and what the engineer needs to verify."
+      "detail": "Detailed explanation of the recommendation."
     }}
   ],
-  "engineerNarrative": "2-3 paragraph overall narrative summary for the reviewing engineer covering key findings, any structural concerns, load path continuity, and items requiring special attention."
+  "engineerNarrative": "2-3 paragraph overall narrative for the reviewing engineer."
 }}
 
-flagSeverity options: "critical", "warning", "info"
-recommendation priority options: "high", "medium", "low"
+flagSeverity options: critical, warning, info
+recommendation priority options: high, medium, low
 
-Building parameters for this analysis:
+Building parameters:
 - Type: {params['building_type']}
 - Stories: {params['stories']}
 - Wall material: {params['wall_material']}
 - Floor system: {params['floor_system']}
 - Roof: {params['roof_type']}
-- Seismic design category: {params['seismic']}
-- Wind exposure: {params['wind']}
-- Ground snow load: {params['snow']} psf
-- Code basis: ASCE 7 / IBC
-
-Use standard IBC/ASCE 7 load values. If the drawing is unclear on any dimension, make a reasonable engineering estimate and note it. Be thorough — identify every wall visible in the plan."""
+- Seismic: {params['seismic']}
+- Wind: {params['wind']}
+- Snow load: {params['snow']} psf
+- Code: ASCE 7 / IBC"""
 
 
 def run_analysis(uploaded_file, params: dict, api_key: str):
-    """Send drawing to Claude API and return parsed JSON result."""
     b64, media_type = encode_file(uploaded_file)
     client = anthropic.Anthropic(api_key=api_key)
 
-    # PDFs use document type; images use image type
     if media_type == "application/pdf":
-        content_block = {
-            "type": "document",
-            "source": {"type": "base64", "media_type": media_type, "data": b64}
-        }
+        content_block = {"type": "document", "source": {"type": "base64", "media_type": media_type, "data": b64}}
     else:
-        content_block = {
-            "type": "image",
-            "source": {"type": "base64", "media_type": media_type, "data": b64}
-        }
+        content_block = {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}}
 
     with st.spinner("Analyzing drawing — this may take 20–40 seconds…"):
         response = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=4096,
             system=build_system_prompt(params),
-            messages=[{
-                "role": "user",
-                "content": [
-                    content_block,
-                    {"type": "text", "text": "Please analyze this architectural drawing set and return the structural analysis JSON."}
-                ]
-            }]
+            messages=[{"role": "user", "content": [
+                content_block,
+                {"type": "text", "text": "Analyze this architectural drawing set and return the structural analysis JSON."}
+            ]}]
         )
 
     raw = "".join(b.text for b in response.content if hasattr(b, "text"))
     clean = raw.replace("```json", "").replace("```", "").strip()
-    # Extract JSON object if there's surrounding text
     match = re.search(r'\{[\s\S]*\}', clean)
     if match:
         clean = match.group(0)
@@ -199,7 +156,6 @@ def run_analysis(uploaded_file, params: dict, api_key: str):
 
 
 def render_results(result: dict, params: dict):
-    """Render analysis results in structured tabs."""
     summary = result.get("summary", {})
     walls = result.get("walls", [])
     openings = result.get("openings", [])
@@ -207,7 +163,6 @@ def render_results(result: dict, params: dict):
 
     st.success("Analysis complete — review all findings with your structural engineer.")
 
-    # Metrics row
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Walls identified", summary.get("totalWalls", len(walls)))
     col2.metric("Load bearing", summary.get("loadBearingCount", sum(1 for w in walls if w.get("loadBearing"))))
@@ -225,7 +180,6 @@ def render_results(result: dict, params: dict):
         sheets = result.get("sheetsIdentified", [])
         if sheets:
             st.write("**Sheets identified:**", ", ".join(sheets))
-
         st.subheader("Load assumptions")
         lcol1, lcol2 = st.columns(2)
         with lcol1:
@@ -241,8 +195,6 @@ def render_results(result: dict, params: dict):
 
     with tab2:
         st.subheader("Wall classification & preliminary loads")
-
-        # Build display table
         if walls:
             import pandas as pd
             rows = []
@@ -259,12 +211,9 @@ def render_results(result: dict, params: dict):
                     "Total load (plf)": w.get("totalLoadPlf", "—") if w.get("loadBearing") else "—",
                     "Flag": f"{flag_icon} {w.get('flag', '')}" if w.get("flag") else "",
                 })
-            df = pd.DataFrame(rows)
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
         else:
             st.info("No wall data returned.")
-
-        # Critical wall callout
         critical = next((w for w in walls if w.get("id") == summary.get("criticalWall")), None)
         if critical:
             st.warning(
@@ -277,22 +226,18 @@ def render_results(result: dict, params: dict):
         st.subheader("Openings & headers")
         if openings:
             import pandas as pd
-            df_open = pd.DataFrame([{
-                "Wall": o.get("wallId", ""),
-                "Type": o.get("type", ""),
-                "Size": o.get("size", ""),
-                "Header required": o.get("headerRequired", ""),
+            st.dataframe(pd.DataFrame([{
+                "Wall": o.get("wallId", ""), "Type": o.get("type", ""),
+                "Size": o.get("size", ""), "Header required": o.get("headerRequired", ""),
                 "Notes": o.get("notes", "")
-            } for o in openings])
-            st.dataframe(df_open, use_container_width=True, hide_index=True)
+            } for o in openings]), use_container_width=True, hide_index=True)
         else:
             st.info("No specific openings flagged.")
 
     with tab4:
         st.subheader("Preliminary recommendations")
         priority_order = {"high": 0, "medium": 1, "low": 2}
-        sorted_recs = sorted(recs, key=lambda r: priority_order.get(r.get("priority", "low"), 2))
-        for rec in sorted_recs:
+        for rec in sorted(recs, key=lambda r: priority_order.get(r.get("priority", "low"), 2)):
             priority = rec.get("priority", "low")
             icon = {"high": "🔴", "medium": "🟡", "low": "🔵"}.get(priority, "🔵")
             label = {"high": "High priority", "medium": "Medium priority", "low": "Low priority"}.get(priority, "")
@@ -303,23 +248,15 @@ def render_results(result: dict, params: dict):
         st.subheader("Engineering narrative")
         st.write(result.get("engineerNarrative", ""))
         st.markdown("---")
-        st.markdown(
-            f"*Analysis parameters: {params['wall_material']} · {params['floor_system']} · "
-            f"{params['seismic']} · {params['wind']} · Snow: {params['snow']} psf · ASCE 7 / IBC*"
-        )
-        st.markdown(
-            "> ⚠️ **Preliminary analysis only.** All values must be reviewed, verified, and stamped by a "
-            "licensed structural engineer before use in construction documents. The engineer of record "
-            "bears full professional liability."
-        )
+        st.markdown(f"*Parameters: {params['wall_material']} · {params['floor_system']} · {params['seismic']} · {params['wind']} · Snow: {params['snow']} psf · ASCE 7 / IBC*")
+        st.markdown("> ⚠️ **Preliminary analysis only.** All values must be reviewed and stamped by a licensed structural engineer before use in construction documents.")
 
 
-# ── Sidebar ──────────────────────────────────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
     st.title("🏗️ Structural Wall Analyzer")
     st.caption("Preliminary analysis tool for structural engineers")
-
     st.markdown("""
     <div class="disclaimer">
     <strong>Engineering review required.</strong> This tool generates preliminary analysis only. 
@@ -328,66 +265,24 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
-    st.subheader("API key")
-    api_key_input = st.text_input(
-        "Anthropic API key",
-        type="password",
-        value=get_api_key(),
-        help="Set ANTHROPIC_API_KEY in .streamlit/secrets.toml or as an environment variable"
-    )
+    api_key_input = get_api_key()
 
     st.subheader("Project parameters")
-
-    building_type = st.selectbox("Building type", [
-        "Single-family residential",
-        "Multi-family residential",
-        "Light commercial",
-        "Mixed use"
-    ])
-
+    building_type = st.selectbox("Building type", ["Single-family residential", "Multi-family residential", "Light commercial", "Mixed use"])
     stories = st.selectbox("Number of stories", ["1", "2", "3", "4+"])
-
     wall_material = st.selectbox("Wall material", [
-        "Wood frame (2×6 @ 16\" OC)",
-        "Wood frame (2×4 @ 16\" OC)",
-        "CMU (8\" block)",
-        "CMU (12\" block)",
-        "Steel stud (3-5/8\")",
-        "Steel stud (6\")",
-        "ICF (6\" core)",
-        "Poured concrete (6\")"
+        "Wood frame (2×6 @ 16\" OC)", "Wood frame (2×4 @ 16\" OC)",
+        "CMU (8\" block)", "CMU (12\" block)",
+        "Steel stud (3-5/8\")", "Steel stud (6\")",
+        "ICF (6\" core)", "Poured concrete (6\")"
     ])
-
     floor_system = st.selectbox("Floor system above", [
-        "Wood joists (2×10 @ 16\")",
-        "Wood joists (2×12 @ 16\")",
-        "TJI / engineered joists",
-        "Concrete slab (5\")",
-        "Concrete slab (8\")",
-        "None (roof only)"
+        "Wood joists (2×10 @ 16\")", "Wood joists (2×12 @ 16\")",
+        "TJI / engineered joists", "Concrete slab (5\")", "Concrete slab (8\")", "None (roof only)"
     ])
-
-    roof_type = st.selectbox("Roof type", [
-        "Gable (asphalt shingle)",
-        "Hip roof",
-        "Flat / low-slope",
-        "Shed roof",
-        "Complex / custom"
-    ])
-
-    seismic = st.selectbox("Seismic design category", [
-        "Low (SDC A/B)",
-        "Moderate (SDC C)",
-        "High (SDC D)",
-        "Very high (SDC E/F)"
-    ])
-
-    wind = st.selectbox("Wind exposure", [
-        "Exposure B (suburban)",
-        "Exposure C (open terrain)",
-        "Exposure D (coastal)"
-    ])
-
+    roof_type = st.selectbox("Roof type", ["Gable (asphalt shingle)", "Hip roof", "Flat / low-slope", "Shed roof", "Complex / custom"])
+    seismic = st.selectbox("Seismic design category", ["Low (SDC A/B)", "Moderate (SDC C)", "High (SDC D)", "Very high (SDC E/F)"])
+    wind = st.selectbox("Wind exposure", ["Exposure B (suburban)", "Exposure C (open terrain)", "Exposure D (coastal)"])
     snow = st.number_input("Ground snow load (psf)", min_value=0, max_value=150, value=0, step=5)
 
 
@@ -403,28 +298,22 @@ uploaded_file = st.file_uploader(
 )
 
 if uploaded_file:
-    file_type = uploaded_file.type
-    if "image" in file_type:
+    if "image" in uploaded_file.type:
         st.image(uploaded_file, caption=uploaded_file.name, use_column_width=True)
     else:
         st.info(f"📄 Loaded: **{uploaded_file.name}** ({uploaded_file.size / 1024:.0f} KB)")
 
     if st.button("▶ Run structural analysis", type="primary", use_container_width=True):
         if not api_key_input:
-            st.error("Please enter your Anthropic API key in the sidebar.")
+            st.error("API key not configured. Please contact the app administrator.")
         else:
             params = {
-                "building_type": building_type,
-                "stories": stories,
-                "wall_material": wall_material,
-                "floor_system": floor_system,
-                "roof_type": roof_type,
-                "seismic": seismic,
-                "wind": wind,
-                "snow": snow
+                "building_type": building_type, "stories": stories,
+                "wall_material": wall_material, "floor_system": floor_system,
+                "roof_type": roof_type, "seismic": seismic,
+                "wind": wind, "snow": snow
             }
             try:
-                # Reset file position before reading
                 uploaded_file.seek(0)
                 result = run_analysis(uploaded_file, params, api_key_input)
                 st.session_state["last_result"] = result
@@ -447,5 +336,5 @@ else:
         3. Click **Run structural analysis**
         4. Review the wall-by-wall breakdown, load calculations, and engineering recommendations
 
-        *All analysis is performed by Claude (claude-opus-4-5) and must be reviewed by a licensed structural engineer.*
+        *All analysis is performed by Claude (claude-sonnet-4-6) and must be reviewed by a licensed structural engineer.*
         """)
