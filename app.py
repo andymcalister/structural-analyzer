@@ -298,14 +298,22 @@ if uploaded_file:
                                 walls, plan_box = detect_wall_segments(img)
                                 st.write(f"  → {len(walls)} wall segments detected")
                             except Exception as e:
-                                st.error(f"Wall detection failed for {label}: {e}")
+                                import traceback
+                                err_msg = f"Wall detection failed for {label}: {e}"
+                                st.session_state.setdefault("errors", []).append(err_msg)
+                                st.session_state.setdefault("errors", []).append(traceback.format_exc())
+                                st.error(err_msg)
                                 continue
 
                         with st.spinner(f"Classifying walls: {label}…"):
                             try:
                                 walls = classify_walls(walls, img, plan_box, params, api_key_input, label)
                             except Exception as e:
-                                st.error(f"Classification failed for {label}: {e}")
+                                import traceback
+                                err_msg = f"Classification failed for {label}: {e}"
+                                st.session_state.setdefault("errors", []).append(err_msg)
+                                st.session_state.setdefault("errors", []).append(traceback.format_exc())
+                                st.error(err_msg)
                                 continue
 
                         floor_results.append((label, img, walls))
@@ -321,6 +329,15 @@ if uploaded_file:
                     st.session_state["floor_results"] = floor_results
                     st.session_state["last_params"] = params
                     st.rerun()
+
+# ── Error log ────────────────────────────────────────────────────────────────
+if st.session_state.get("errors"):
+    with st.expander(f"⚠️ Errors ({len(st.session_state['errors'])} entries) — click to expand", expanded=True):
+        for err in st.session_state["errors"]:
+            st.code(err)
+    if st.button("Clear error log"):
+        st.session_state["errors"] = []
+        st.rerun()
 
 # ── Results ───────────────────────────────────────────────────────────────────
 if "floor_results" in st.session_state and st.session_state["floor_results"]:
